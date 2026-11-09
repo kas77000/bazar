@@ -94,12 +94,6 @@ With `27=1` (the usual setting) neither condition is met, and the residual is lo
 | `192=2` or `3` | Change venue and pricing behaviour |
 | `23=0` in the template | Can silently block the EOD switch (B) |
 
-## Not verified in code
-
-- **MOC leg size with `27=11`.** It's calculated in `SysOrder.getMocSize`, which isn't in our copy of the source. If it comes out as 0, no MOC leg is created; the continuous leg then keeps the close on and sends the **whole** residual at 16:00. The goal still holds, but nothing is held back for the close in advance.
-- **The residual amount** (`SysOrder.residualToMoc`). Same file, not in our copy.
-- **HKEX accepting the order sent just after 16:00**, during the auction's first minute (reference-price period).
-
 ## To verify on a test order
 
 - [ ] `setSmartCloseRelay:` shows `SMART_CLOSE` with `moc_rate_type` 11 and `moc_rate` 20
