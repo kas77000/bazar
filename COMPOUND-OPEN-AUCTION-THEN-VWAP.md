@@ -2,7 +2,7 @@
 
 ## Proposals
 
-Both proposals do the same thing. They differ only in the unit used to set the buffer after the open.
+Proposals A and B do the same thing and differ only in the unit used to set the buffer after the open. Proposal C shortens the buffer to 5 seconds. Proposal D replaces the LINE auction leg with an auction-only SMOO leg (**recommended**, see [Caveat: the LINE leg during the buffer](#caveat-the-line-leg-during-the-buffer)).
 
 **Proposal A: buffer in minutes (1 minute)**
 ```
@@ -21,6 +21,32 @@ Both proposals do the same thing. They differ only in the unit used to set the b
 | Switch to VWAP | `1` = 1 minute after the open | `30` = 30 seconds after the open |
 | Finest buffer possible | 1 minute | 1 second (any value, e.g. `15`, `45`, `90`) |
 | Best for | Markets with a random end or frequent delayed opens | Markets with a clean, on-time open |
+
+**Proposal C: LINE with a 5-second buffer**
+```
+9001=COMPOUND;9012=139=3;9060=S,C,-3600_1=LINE^217=1^218=20^283=2^LOR=0.05,5_1=VWAP^6=10^15=1
+```
+- Same as Proposal B, but the switch to VWAP is **5 seconds** after the continuous open.
+- Narrows the window in which the LINE leg can trade in continuous trading, but does not close it (in the 2026-11-11 test, LINE completed the order 4 seconds after the open).
+- Gives little protection against a late uncross. Avoid in markets with a random end or frequent delayed opens.
+
+**Proposal D: SMOO auction leg (auction only), recommended**
+```
+9001=COMPOUND;9012=139=3;9060=S,C,-3600_1=SMOO^217=1^218=20^283=2^LOR=0.05,5_1=VWAP^6=10^15=1
+```
+- Leg 1 is **SMOO**: it only trades in the opening auction. Once the stock has opened, the auction has ended or anything has filled, it stops and closes itself (`ConcertStrategy.java:6264-6266`). It never trades in continuous trading.
+- `217=1` is **required**: without it, an SMOO leg creates no order at all (`FlexOrderStream.java:15095-15101`).
+- If the compound tries to re-create the SMOO leg after the open, no order is created (`FlexOrderStream.java:15100`).
+- With SMOO, the buffer only delays the start of VWAP; it no longer gives LINE a window to trade. It can be made longer (e.g. `30_`) for protection against a late uncross at little cost.
+- `15=1` keeps the VWAP leg in the closing auction (on by default in HK and most Asian markets; set explicitly so it doesn't depend on the market).
+
+| | A | B | C | D |
+|---|---|---|---|---|
+| Auction leg algo | LINE | LINE | LINE | **SMOO** |
+| Switch to VWAP | open + 1 min | open + 30 s | open + 5 s | open + 5 s |
+| Auction leg can trade in continuous before the switch | Yes, up to 1 min | Yes, up to 30 s | Yes, up to 5 s | **No** |
+| Protection against a late uncross | Good | Medium | Low | Low (lengthen to `30_` if needed) |
+| Tested | No | No | No | No |
 
 ## What it does
 
@@ -79,12 +105,59 @@ The VWAP leg is sized as *order size minus filled*. The buffer lets the auction 
 - **60 seconds or more (Proposal A, or B with `60_`/`90_`):** where the open has a random end or delayed opens are common.
 - A buffer won't fully protect a stock that opens very late (several minutes). In that case the auction leg can still be cancelled before the uncross.
 
+## Caveat: the LINE leg during the buffer
+
+**With a LINE auction leg (Proposals A, B, C), the buffer is a window in which LINE trades in continuous trading, and it can complete the order before VWAP ever starts.**
+
+### What happened in the test (2026-11-11, 669.HK, sell 1,000, market order, Proposal A without `283`)
+
+| Time | Event |
+|---|---|
+| 09:09 to 09:19 | LINE leg sends 5 opening-auction orders (HKEX_OPEN, CITI_OPEN), limit 137.1 |
+| 09:20:02 | HK auction uncrosses: **800 / 1,000 filled** at 140.7 |
+| 09:30:00 | Continuous trading starts (`C`). The LINE leg is still active (switch at 09:31) |
+| 09:30:04 | LINE sends a `CITI_TAKE` (`must_make`) for the last 200 at limit 140.6 → **filled**. Order complete |
+| 09:31:00 | Switch time. Nothing left (size − filled = 0), so **no VWAP leg is created** |
+
+### Why
+
+1. **The leg stays LINE for its whole life.** `relaySmartOpenOrder` only turns an auction leg into SMOO (auction only) when the **parent** order carries `217`:
+   ```java
+   if (!sysorder.stock().opened() && sysorder.parameters().moo_rate_type() > 0)   // parent's 217
+       parameters.setAlgorithm(Algorithm.SMOO);
+   ```
+   In the compound, `217` is on the leg, not the parent, so the leg keeps `1=LINE`.
+2. **The leg is created for the full remaining size** (`size = sysorder.size() - sysorder.makes()`), not just the auction part. Whatever the auction doesn't fill stays on the LINE leg.
+3. **After the open, LINE works the remainder as a participation algo.** The child order was marked `must_make`: the scheduler set a goal for how much must be filled by a given time. When that goal is due and the leg is behind, the regulator sends an aggressive take (`CandidateRegulator.java:339-382`). Most likely LINE's target, measured against the large auction volume, was far above the order size, so the whole remainder was taken at once. *(Not confirmed: check the goal for the leg in kdb, see below.)*
+
+### Consequences
+
+- **The remainder can be taken aggressively** (crossing the spread) at the start of continuous trading, instead of being worked by VWAP.
+- **VWAP may never start.** The switch is time-based, so if nothing is left at the switch time, no VWAP leg is created. This is expected behaviour, not a bug.
+- **The smaller the order relative to the auction volume, the more likely this is.** A small remainder is easily completed in one take.
+- **A shorter buffer doesn't fix it.** In the test, LINE completed 4 seconds after the open, which is inside a 5-second buffer (Proposal C).
+
+### How to avoid it
+
+- **Use Proposal D (SMOO leg).** The auction leg never trades in continuous trading, so the remainder goes to VWAP.
+- Alternatively, cap LINE's participation on the auction leg (e.g. `6=` max rate) to slow it down during the buffer. This reduces the risk but doesn't remove it.
+
+### Checking a test order
+
+```q
+/ the must-make goal behind the take (leg id_target)
+select from goal where date=.z.d, id_target=<leg id_target>
+/ child orders of the leg: look for venuetype must_make / TAKE venues after the open
+select time,id_work,venue,venuetype,size,otype,price,make,avg_fill_price,t_gen from workorder where date=.z.d, id_target=<leg id_target>
+```
+
 ## Issues found during testing
 
 | Error | Cause | Fix |
 |---|---|---|
 | `SUBSYSORDER_ERROR` | Leg 1 used `1=INLINE`. `INLINE` isn't in the `Algorithm` enum or the shorthand map, so the leg resolved to `UNKNOWN` and failed validation (`FlexOrderStream.java:13339`). The parent is then rejected (`FlexOrderStream.java:14767`) | Use `1=LINE` |
 | `Invalid Order: Price is 0 but price mode is open` | The rule at `config/ai.fixmsg.properties:138` injects `164=0^LOR=0` when the order doesn't set `LOR`. With both bands at 0, no auction limit is computed (`OpenWorker.java:206`), so the auction child is sent as a market order with price 0 and rejected downstream | Add `283=2^LOR=0.05` to leg 1 so the engine computes a limit from the theoretical price |
+| Order completed by LINE at 09:30:04 with a `CITI_TAKE`; VWAP never started | The LINE auction leg holds the full remaining size and keeps trading in continuous until the switch. It took the last 200 shares 4 seconds after the open (see [Caveat](#caveat-the-line-leg-during-the-buffer)) | Use Proposal D (SMOO auction leg) |
 
 ## Changes from the original request
 
@@ -113,6 +186,8 @@ Original: `9001=COMPOUND^9012=139=2^9060=M^0_1=INLINE^217=1^218=20^220=1^1_1=VWA
 - [ ] Log line `compoundTimeTracker thresholds:` shows the switch at open + 1 minute (A) or open + 30s (B)
 - [ ] The smart-open log shows the auction size ≈ 20% of the indicated matched volume
 - [ ] After the switch, the VWAP leg size = order size − auction fill
+- [ ] Proposals A/B/C: no `must_make` / TAKE child orders on the LINE leg between the open and the switch
+- [ ] Proposal D: one SMOO leg that only has opening-auction child orders, then one VWAP leg. In HK (auction 09:20, continuous 09:30), check there are no repeated empty SMOO legs created and closed between 09:20 and 09:30
 
 Checking the legs in kdb (OMS), where `p` is the compound's `id_target`. Each leg is a `target` row whose `id_source` is the parent id (`FlexOrderStream.java:2877`):
 
