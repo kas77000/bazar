@@ -51,7 +51,9 @@ Proposals A and B do the same thing and differ only in the unit used to set the 
 - **No buffer:** if the stock uncrosses late (after the scheduled open), the LINE leg has already ended and the auction order is cancelled. Same trade-off as a 0-second buffer.
 - **Simpler alternative:** putting `217=1^218=20` on the **parent** (in `9012`) instead of on the leg makes the engine turn the first leg into SMOO automatically (`relaySmartOpenOrder` checks the parent's `217`). That is effectively Proposal D.
 
-Proposal D is still preferred: it needs no market-specific time and keeps a buffer. Use E only if the auction leg must stay LINE.
+**E is not suitable for a setup that must work in every market.** There is no tag to end a leg relative to the open: tag `2` (start) accepts offsets from the open (`30s`, `5m`, `1h`, `Parameters.java:3005`), but tag `3` (end) only takes a clock time, and the only relative end offset (`_start_end_offset`, `Parameters.java:5210`) is measured from the **close**. So making LINE auction-only needs a different end time per market.
+
+**For all markets, use Proposal D.** It needs no market-specific time and keeps a buffer.
 
 | | A | B | C | D | E |
 |---|---|---|---|---|---|
