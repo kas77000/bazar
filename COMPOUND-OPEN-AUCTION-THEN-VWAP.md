@@ -2,7 +2,7 @@
 
 ## Proposals
 
-Proposals A and B do the same thing and differ only in the unit used to set the buffer after the open. Proposal C shortens the buffer to 5 seconds. Proposal D replaces the LINE auction leg with an auction-only SMOO leg (**recommended**, see [Caveat: the LINE leg during the buffer](#caveat-the-line-leg-during-the-buffer)).
+Proposals A and B do the same thing and differ only in the unit used to set the buffer after the open. Proposal C shortens the buffer to 5 seconds. Proposal D replaces the LINE auction leg with an auction-only SMOO leg (**recommended**, see [Caveat: the LINE leg during the buffer](#caveat-the-line-leg-during-the-buffer)). Proposal E keeps LINE but makes it auction-only with an end time at the open.
 
 **Proposal A: buffer in minutes (1 minute)**
 ```
@@ -40,13 +40,27 @@ Proposals A and B do the same thing and differ only in the unit used to set the 
 - With SMOO, the buffer only delays the start of VWAP; it no longer gives LINE a window to trade. It can be made longer (e.g. `30_`) for protection against a late uncross at little cost.
 - `15=1` keeps the VWAP leg in the closing auction (on by default in HK and most Asian markets; set explicitly so it doesn't depend on the market).
 
-| | A | B | C | D |
-|---|---|---|---|---|
-| Auction leg algo | LINE | LINE | LINE | **SMOO** |
-| Switch to VWAP | open + 1 min | open + 30 s | open + 5 s | open + 5 s |
-| Auction leg can trade in continuous before the switch | Yes, up to 1 min | Yes, up to 30 s | Yes, up to 5 s | **No** |
-| Protection against a late uncross | Good | Medium | Low | Low (lengthen to `30_` if needed) |
-| Tested | No | No | No | No |
+**Proposal E: LINE leg made auction-only with an end time (HK example)**
+```
+9001=COMPOUND;9012=139=3;9060=S,C,-3600_1=LINE^217=1^218=20^283=2^LOR=0.05^3=09:30:00,0_1=VWAP^6=10^15=1
+```
+- Keeps **LINE** as the auction leg, but gives it an **end time at the continuous open** with tag `3` inside the leg (`Parameters.java:3032`, `__p_3` = end time). LINE does the auction, then stops when continuous trading starts.
+- LINE is not must-complete by default (`Algorithm.defaultMustComplete()` is only true for IIS), so at its end time it stops with the remainder unfilled instead of forcing completion.
+- The switch to VWAP is at **open + 0** (`0_`), the same moment as the LINE end time. This avoids a gap in which the LINE leg has ended and the compound re-creates it with an end time already in the past.
+- **Market specific:** tag `3` is an absolute clock time, so it must be set to that market's continuous open (`09:30:00` for HK, `09:00:00` for JP, etc.). Not yet checked: whether the time is read in exchange local time or algo server time (`_endstamp_need_conversion`). Verify on a test order.
+- **No buffer:** if the stock uncrosses late (after the scheduled open), the LINE leg has already ended and the auction order is cancelled. Same trade-off as a 0-second buffer.
+- **Simpler alternative:** putting `217=1^218=20` on the **parent** (in `9012`) instead of on the leg makes the engine turn the first leg into SMOO automatically (`relaySmartOpenOrder` checks the parent's `217`). That is effectively Proposal D.
+
+Proposal D is still preferred: it needs no market-specific time and keeps a buffer. Use E only if the auction leg must stay LINE.
+
+| | A | B | C | D | E |
+|---|---|---|---|---|---|
+| Auction leg algo | LINE | LINE | LINE | **SMOO** | LINE + end time |
+| Switch to VWAP | open + 1 min | open + 30 s | open + 5 s | open + 5 s | open + 0 |
+| Auction leg can trade in continuous before the switch | Yes, up to 1 min | Yes, up to 30 s | Yes, up to 5 s | **No** | **No** (ends at the open) |
+| Protection against a late uncross | Good | Medium | Low | Low (lengthen to `30_` if needed) | None |
+| Market-specific setting | No | No | No | No | Yes (end time) |
+| Tested | No | No | No | No | No |
 
 ## What it does
 
@@ -140,6 +154,7 @@ The VWAP leg is sized as *order size minus filled*. The buffer lets the auction 
 ### How to avoid it
 
 - **Use Proposal D (SMOO leg).** The auction leg never trades in continuous trading, so the remainder goes to VWAP.
+- **Or Proposal E (LINE with an end time at the open).** LINE stops at the continuous open, and VWAP starts at the same moment. Needs a market-specific end time and has no buffer.
 - Alternatively, cap LINE's participation on the auction leg (e.g. `6=` max rate) to slow it down during the buffer. This reduces the risk but doesn't remove it.
 
 ### Checking a test order
@@ -188,6 +203,7 @@ Original: `9001=COMPOUND^9012=139=2^9060=M^0_1=INLINE^217=1^218=20^220=1^1_1=VWA
 - [ ] After the switch, the VWAP leg size = order size − auction fill
 - [ ] Proposals A/B/C: no `must_make` / TAKE child orders on the LINE leg between the open and the switch
 - [ ] Proposal D: one SMOO leg that only has opening-auction child orders, then one VWAP leg. In HK (auction 09:20, continuous 09:30), check there are no repeated empty SMOO legs created and closed between 09:20 and 09:30
+- [ ] Proposal E: the LINE leg's `t_end` in `target` is the market's continuous open (confirms the end-time timezone), the LINE leg sends no child orders after the open, and the VWAP leg starts at the open for the remaining quantity
 
 Checking the legs in kdb (OMS), where `p` is the compound's `id_target`. Each leg is a `target` row whose `id_source` is the parent id (`FlexOrderStream.java:2877`):
 
